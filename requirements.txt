@@ -1,0 +1,4 @@
+esptool
+mpremote
+micropython-esp32-stubs
+micropython-stdlib-stubs

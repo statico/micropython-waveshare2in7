@@ -38,32 +38,22 @@ Purchase links (referral-free):
 | RST         | GPIO 4    | Reset        |
 | BUSY        | GPIO 15   | Busy Signal  |
 
-## Installation
-
-1. Copy `waveshare2in7.py` to your MicroPython device
-2. Ensure your device supports SPI and has the required GPIO pins available
-
 ## Quick Start
 
-```python
-from machine import Pin, SPI
-from waveshare2in7 import EPD, BLACK, WHITE
+Create a virutal environment with [uv](https://docs.astral.sh/uv/) and install the dependencies:
 
-# Initialize SPI and pins
-spi = SPI(2, baudrate=4000000, polarity=0, phase=0, sck=Pin(18), mosi=Pin(23))
-cs = Pin(5, Pin.OUT)
-dc = Pin(2, Pin.OUT)
-rst = Pin(4, Pin.OUT)
-busy = Pin(15, Pin.IN)
+```shell
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+mpremote --version
+```
 
-# Create display instance
-epd = EPD(spi, cs, dc, rst, busy, orientation=0, debug=True)
+Copy and run the library and `main.py` for a demo:
 
-# Initialize and display content
-epd.init()
-epd.fill(WHITE)  # Clear to white
-epd.text("Hello World!", 10, 40, BLACK)
-epd.display()
+```shell
+mpremote cp -r waveshare2in7.py david.bmp :
+mpremote run main.py
 ```
 
 ## API Reference
