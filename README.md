@@ -2,7 +2,10 @@
 
 A MicroPython driver for the [Waveshare 2.7" Black/White e-paper display](https://www.waveshare.com/wiki/2.7inch_e-Paper_HAT). This library provides full control over the display with support for multiple orientations, optimized SPI transfers, and a rich set of graphics functions.
 
-![epaper](https://github.com/user-attachments/assets/24d8bf74-448c-4cfd-93c4-8e0f8e35fe04)
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/24d8bf74-448c-4cfd-93c4-8e0f8e35fe04" alt="epaper" width="45%" style="margin-right: 10px;">
+  <img src="https://github.com/user-attachments/assets/fc069d41-3a70-4a1e-8b3c-56e4b33ca129" alt="epaper2" width="45%">
+</div>
 
 NOTE: This was mostly vibe coded with Cursor and Claude Code by pointing it at [the Waveshare Arduino library](https://github.com/waveshareteam/e-Paper/tree/master/Arduino/epd2in7b_V2) and saying "make it do the thing."
 
