@@ -1,11 +1,16 @@
 """
-Fixed MicroPython Waveshare 2.7" Black/White GDEW027W3 e-paper display driver
-Based on working implementation from previous tests
+MicroPython Waveshare 2.7" Black/White GDEW027W3 e-paper display driver
+
+Base on https://github.com/waveshareteam/e-Paper/tree/master/Arduino/epd2in7b_V2 and mostly but not entirely vibe coded with Cursor
 """
 
 from micropython import const
-from time import sleep_ms
+from time import sleep_ms, ticks_ms
 import framebuf
+import struct
+
+WHITE = const(0xFF)
+BLACK = const(0x00)
 
 # Display resolution (portrait mode) - corrected to match Arduino
 EPD_WIDTH = const(176)
@@ -32,15 +37,19 @@ POWER_OPTIMIZATION = const(0xF8)
 
 BUSY = const(0)  # 0=busy, 1=idle
 
+# Optimization constants
+SPI_BATCH_SIZE = const(64)  # Optimal batch size for SPI transfers
+
 
 class EPD:
-    def __init__(self, spi, cs, dc, rst, busy, orientation=0):
+    def __init__(self, spi, cs, dc, rst, busy, orientation=0, debug=False):
         self.spi = spi
         self.cs = cs
         self.dc = dc
         self.rst = rst
         self.busy = busy
         self.orientation = orientation
+        self.debug = debug
 
         # Initialize pins properly
         self.cs.init(self.cs.OUT, value=1)
@@ -56,6 +65,10 @@ class EPD:
             self.buffer, self.width, self.height, framebuf.MONO_HLSB
         )
 
+    def _log(self, message):
+        if self.debug:
+            print(f"[EPD] {ticks_ms()}ms: {message}")
+
     @property
     def width(self):
         """Get display width based on current orientation"""
@@ -68,6 +81,7 @@ class EPD:
 
     def set_orientation(self, orientation):
         """Change orientation without reinitializing"""
+        self._log(f"Setting orientation to {orientation}")
         self.orientation = orientation
 
     def _command(self, command, data=None):
@@ -80,7 +94,7 @@ class EPD:
             self._data(data)
 
     def _data(self, data):
-        """Send data to display"""
+        """Send data to display - optimized for single byte"""
         self.dc(1)
         self.cs(0)
         if isinstance(data, int):
@@ -89,9 +103,55 @@ class EPD:
             self.spi.write(data)
         self.cs(1)
 
+    def _data_batch(self, data_list):
+        """Send data in batches for better SPI performance"""
+        if not data_list:
+            return
+
+        self.dc(1)
+        self.cs(0)
+
+        # Convert list to bytearray for efficient transfer
+        if isinstance(data_list, list):
+            data_bytes = bytearray(data_list)
+        else:
+            data_bytes = data_list
+
+        self.spi.write(data_bytes)
+        self.cs(1)
+
+    def _clear_display_fast(self):
+        """Fast clear using display commands instead of frame buffer"""
+        self._log("Fast clearing display")
+
+        # Set RAM address counters
+        self._command(0x4E)
+        self._data(0x00)
+        self._command(0x4F)
+        self._data(0x00)
+        self._data(0x00)
+
+        # Write RAM for black/white
+        self._command(0x24)
+
+        # Send all white bytes in batches
+        buffer_size = len(self.buffer)
+        batch_size = SPI_BATCH_SIZE
+        white_data = [0xFF] * batch_size
+
+        for i in range(0, buffer_size, batch_size):
+            end = min(i + batch_size, buffer_size)
+            if end - i == batch_size:
+                # Full batch
+                self._data_batch(white_data)
+            else:
+                # Partial batch
+                partial_data = [0xFF] * (end - i)
+                self._data_batch(partial_data)
+
     def init(self):
         """Initialize display using corrected sequence"""
-        print("Initializing 2.7 inch e-paper display...")
+        self._log("Initializing display")
 
         # Reset
         self.rst(1)
@@ -141,13 +201,19 @@ class EPD:
         self._data(0x00)
         self._data(0x00)
 
+        self._log("Display initialized")
+
     def wait_until_idle(self):
         """Wait until display is not busy"""
+        self._log("Waiting until display is not busy...")
         while self.busy.value() == BUSY:
             sleep_ms(100)
+        self._log("Display is not busy")
 
     def display_frame(self, frame_buffer):
-        """Display frame buffer with proper orientation handling"""
+        """Display frame buffer with proper orientation handling and optimized SPI"""
+        self._log("Displaying frame")
+
         # Clear any previous data
         self._command(0x24)  # Write RAM for black/white
         for i in range(0, len(frame_buffer)):
@@ -167,97 +233,137 @@ class EPD:
 
         # Get original display dimensions (portrait)
         orig_width = EPD_WIDTH
-        orig_height = EPD_HEIGHT
-        orig_bytes_per_row = orig_width // 8
 
         if self.orientation == 0:
-            # Default portrait mode - send data as-is
-            for i in range(len(frame_buffer)):
-                self._data(frame_buffer[i])
+            self._log("Displaying frame in portrait mode")
+            # Default portrait mode - send data in batches
+            self._send_buffer_batched(frame_buffer)
 
         elif self.orientation == 2:
+            self._log("Displaying frame in portrait upside down mode")
             # Portrait upside down - reverse byte order and flip bits
-            for i in range(len(frame_buffer) - 1, -1, -1):
+            flipped_buffer = bytearray(len(frame_buffer))
+            for i in range(len(frame_buffer)):
                 # Flip bits in each byte (reverse bit order)
                 byte_val = frame_buffer[i]
                 flipped_byte = 0
                 for bit in range(8):
                     if byte_val & (1 << bit):
                         flipped_byte |= 1 << (7 - bit)
-                self._data(flipped_byte)
+                flipped_buffer[len(frame_buffer) - 1 - i] = flipped_byte
+            self._send_buffer_batched(flipped_buffer)
 
         elif self.orientation == 1:
-            logical_buffer = frame_buffer
-            # Physical buffer for actual display dimensions (176x264)
-            physical_buffer_size = (EPD_WIDTH * EPD_HEIGHT + 7) // 8
-            physical_buffer = bytearray(physical_buffer_size)
-
-            def logical_to_physical(x, y):
-                # Rotate 90° clockwise: logical (264w×176h) -> physical (176w×264h)
-                # For 90° clockwise: (x,y) -> (y, width-1-x)
-                # But we need to map from logical (264×176) to physical (176×264)
-                new_x = y
-                new_y = self.width - 1 - x  # self.width is 264 in landscape mode
-                return new_x, new_y
-
-            def get_logical_pixel(x, y):
-                # Get pixel from logical buffer (landscape: 264×176)
-                bit_index = y * self.width + x
-                byte_index = bit_index // 8
-                bit_offset = bit_index % 8
-                return (logical_buffer[byte_index] >> (7 - bit_offset)) & 1
-
-            def set_physical_pixel(x, y, value):
-                # Set pixel in physical buffer (portrait: 176×264)
-                bit_index = y * EPD_WIDTH + x
-                byte_index = bit_index // 8
-                bit_offset = bit_index % 8
-                if value:
-                    physical_buffer[byte_index] |= 1 << (7 - bit_offset)
-                else:
-                    physical_buffer[byte_index] &= ~(1 << (7 - bit_offset))
-
-            # Transform from logical coordinates to physical coordinates
-            print("Transforming from logical coordinates to physical coordinates")
-            for ly in range(self.height):  # logical height (176)
-                for lx in range(self.width):  # logical width (264)
-                    px, py = logical_to_physical(lx, ly)
-                    set_physical_pixel(px, py, get_logical_pixel(lx, ly))
-
-            # Send the rotated buffer
-            for i in range(len(physical_buffer)):
-                self._data(physical_buffer[i])
+            self._log("Displaying frame in landscape mode")
+            rotated_buffer = self._rotate_buffer_90_cw(frame_buffer)
+            self._send_buffer_batched(rotated_buffer)
 
         elif self.orientation == 3:
-            # Landscape left - rotate 90 degrees counter-clockwise
-            # Need to transpose the image: swap width/height and rotate data
-            new_width = orig_height
-            new_height = orig_width
-            new_bytes_per_row = new_width // 8
+            self._log("Displaying frame in landscape upside down mode")
+            rotated_buffer = self._rotate_buffer_270_cw(frame_buffer)
+            self._send_buffer_batched(rotated_buffer)
 
-            # Create rotated buffer
-            rotated_buffer = bytearray(len(frame_buffer))
+        # Display update control
+        self._log("Display update control")
+        self._command(0x22)
+        self._data(0xC7)
+        self._command(0x20)  # Master activation
+        self.wait_until_idle()
 
-            for y in range(orig_height):
-                for x in range(orig_width):
-                    # Source position in original buffer
-                    src_byte_idx = y * orig_bytes_per_row + x // 8
-                    src_bit_idx = 7 - (x % 8)  # MONO_HLSB format
+    def _send_buffer_batched(self, buffer):
+        """Send buffer data in optimized batches"""
+        batch_size = SPI_BATCH_SIZE
+        for i in range(0, len(buffer), batch_size):
+            end = min(i + batch_size, len(buffer))
+            batch_data = buffer[i:end]
+            self._data_batch(batch_data)
 
-                    # Destination position in rotated buffer
-                    # Rotate 90° counter-clockwise: (x,y) -> (height-1-y, x)
-                    new_x = orig_height - 1 - y
-                    new_y = x
-                    dst_byte_idx = new_y * new_bytes_per_row + new_x // 8
-                    dst_bit_idx = 7 - (new_x % 8)
+    def _rotate_buffer_90_cw(self, logical_buffer):
+        """Rotate buffer 90° clockwise with optimized algorithm"""
+        # Physical buffer for actual display dimensions (176x264)
+        physical_buffer_size = (EPD_WIDTH * EPD_HEIGHT + 7) // 8
+        physical_buffer = bytearray(physical_buffer_size)
 
-                    # Copy bit
-                    if frame_buffer[src_byte_idx] & (1 << src_bit_idx):
-                        rotated_buffer[dst_byte_idx] |= 1 << dst_bit_idx
+        def logical_to_physical(x, y):
+            # Rotate 90° clockwise: logical (264w×176h) -> physical (176w×264h)
+            # For 90° clockwise: (x,y) -> (y, width-1-x)
+            new_x = y
+            new_y = self.width - 1 - x  # self.width is 264 in landscape mode
+            return new_x, new_y
 
-            # Send rotated data
-            for i in range(len(rotated_buffer)):
-                self._data(rotated_buffer[i])
+        def get_logical_pixel(x, y):
+            # Get pixel from logical buffer (landscape: 264×176)
+            bit_index = y * self.width + x
+            byte_index = bit_index // 8
+            bit_offset = bit_index % 8
+            return (logical_buffer[byte_index] >> (7 - bit_offset)) & 1
+
+        def set_physical_pixel(x, y, value):
+            # Set pixel in physical buffer (portrait: 176×264)
+            bit_index = y * EPD_WIDTH + x
+            byte_index = bit_index // 8
+            bit_offset = bit_index % 8
+            if value:
+                physical_buffer[byte_index] |= 1 << (7 - bit_offset)
+            else:
+                physical_buffer[byte_index] &= ~(1 << (7 - bit_offset))
+
+        # Transform from logical coordinates to physical coordinates
+        self._log("Transforming coordinates")
+        for ly in range(self.height):  # logical height (176)
+            for lx in range(self.width):  # logical width (264)
+                px, py = logical_to_physical(lx, ly)
+                set_physical_pixel(px, py, get_logical_pixel(lx, ly))
+
+        return physical_buffer
+
+    def _rotate_buffer_270_cw(self, logical_buffer):
+        """Rotate buffer 270° clockwise (90° counterclockwise) with optimized algorithm"""
+        # Physical buffer for actual display dimensions (176x264)
+        physical_buffer_size = (EPD_WIDTH * EPD_HEIGHT + 7) // 8
+        physical_buffer = bytearray(physical_buffer_size)
+
+        def logical_to_physical(x, y):
+            # Rotate 270° clockwise: logical (264w×176h) -> physical (176w×264h)
+            # For 270° clockwise: (x,y) -> (height-1-y, x)
+            new_x = self.height - 1 - y  # self.height is 176 in landscape mode
+            new_y = x
+            return new_x, new_y
+
+        def get_logical_pixel(x, y):
+            # Get pixel from logical buffer (landscape: 264×176)
+            bit_index = y * self.width + x
+            byte_index = bit_index // 8
+            bit_offset = bit_index % 8
+            return (logical_buffer[byte_index] >> (7 - bit_offset)) & 1
+
+        def set_physical_pixel(x, y, value):
+            # Set pixel in physical buffer (portrait: 176×264)
+            bit_index = y * EPD_WIDTH + x
+            byte_index = bit_index // 8
+            bit_offset = bit_index % 8
+            if value:
+                physical_buffer[byte_index] |= 1 << (7 - bit_offset)
+            else:
+                physical_buffer[byte_index] &= ~(1 << (7 - bit_offset))
+
+        # Transform from logical coordinates to physical coordinates
+        self._log("Transforming coordinates")
+        for ly in range(self.height):  # logical height (176)
+            for lx in range(self.width):  # logical width (264)
+                px, py = logical_to_physical(lx, ly)
+                set_physical_pixel(px, py, get_logical_pixel(lx, ly))
+
+        return physical_buffer
+
+    def display(self):
+        """Display current frame buffer"""
+        self.display_frame(self.buffer)
+
+    def clear(self):
+        """Clear display to white using optimized method"""
+        self._log("Clearing display")
+        self._clear_display_fast()
 
         # Display update control
         self._command(0x22)
@@ -265,19 +371,46 @@ class EPD:
         self._command(0x20)  # Master activation
         self.wait_until_idle()
 
-    def display(self):
-        """Display current frame buffer"""
-        self.display_frame(self.buffer)
-
-    def clear(self):
-        """Clear display to white using working frame buffer method"""
-        self.framebuf.fill(0xFF)  # Fill frame buffer with white
-        self.display()  # Display the white frame buffer
+        # Also clear the frame buffer
+        self.framebuf.fill(0xFF)
 
     def fill_black(self):
-        """Fill display with black"""
+        """Fill display with black using optimized method"""
+        self._log("Filling display with black")
+
+        # Set RAM address counters
+        self._command(0x4E)
+        self._data(0x00)
+        self._command(0x4F)
+        self._data(0x00)
+        self._data(0x00)
+
+        # Write RAM for black/white
+        self._command(0x24)
+
+        # Send all black bytes in batches
+        buffer_size = len(self.buffer)
+        batch_size = SPI_BATCH_SIZE
+        black_data = [0x00] * batch_size
+
+        for i in range(0, buffer_size, batch_size):
+            end = min(i + batch_size, buffer_size)
+            if end - i == batch_size:
+                # Full batch
+                self._data_batch(black_data)
+            else:
+                # Partial batch
+                partial_data = [0x00] * (end - i)
+                self._data_batch(partial_data)
+
+        # Display update control
+        self._command(0x22)
+        self._data(0xC7)
+        self._command(0x20)  # Master activation
+        self.wait_until_idle()
+
+        # Also fill the frame buffer
         self.framebuf.fill(0x00)
-        self.display()
 
     def sleep(self):
         """Put display into deep sleep mode"""
@@ -285,7 +418,7 @@ class EPD:
 
     def reset_display(self):
         """Reset display and clear to white"""
-        print("Resetting display...")
+        self._log("Resetting display")
 
         # Hardware reset
         self.rst(1)
@@ -301,19 +434,19 @@ class EPD:
         # Clear to white
         self.clear()
 
-        print("✓ Display reset complete")
+        self._log("Display reset complete")
 
     def force_clear(self):
-        """Force clear to white"""
-        print("Force clearing display...")
+        """Force clear to white using optimized method"""
+        self._log("Force clearing display")
         self.clear()
-        print("✓ Force clear complete")
+        self._log("Force clear complete")
 
     def clear_large_range(self):
         """Clear to white (same as regular clear)"""
-        print("Clearing display...")
+        self._log("Clearing display")
         self.clear()
-        print("✓ Clear complete")
+        self._log("Clear complete")
 
     # Graphics methods that use the framebuffer
     def fill(self, color):
@@ -345,8 +478,103 @@ class EPD:
         self.framebuf.hline(x, y, w, color)
 
     def circle(self, x, y, radius, color=0x00):
-        """Draw a circle"""
-        for i in range(-radius, radius + 1):
-            for j in range(-radius, radius + 1):
-                if i * i + j * j <= radius * radius:
-                    self.framebuf.pixel(x + i, y + j, color)
+        """Draw a circle using optimized Bresenham's algorithm"""
+        x0, y0 = x, y
+        x1, y1 = radius, 0
+        err = 0
+
+        while x1 >= y1:
+            # Draw 8 symmetric points at once
+            self.framebuf.pixel(x0 + x1, y0 + y1, color)
+            self.framebuf.pixel(x0 + y1, y0 + x1, color)
+            self.framebuf.pixel(x0 - y1, y0 + x1, color)
+            self.framebuf.pixel(x0 - x1, y0 + y1, color)
+            self.framebuf.pixel(x0 - x1, y0 - y1, color)
+            self.framebuf.pixel(x0 - y1, y0 - x1, color)
+            self.framebuf.pixel(x0 + y1, y0 - x1, color)
+            self.framebuf.pixel(x0 + x1, y0 - y1, color)
+
+            if err <= 0:
+                y1 += 1
+                err += 2 * y1 + 1
+            if err > 0:
+                x1 -= 1
+                err -= 2 * x1 + 1
+
+    def _load_bmp(self, filename):
+        """Load a 1-bit BMP file and return framebuffer data"""
+        with open(filename, "rb") as f:
+            # Read BMP header (14 bytes)
+            header = f.read(14)
+            if header[0:2] != b"BM":
+                raise ValueError("Not a BMP file")
+
+            # Get offset to pixel data
+            pixel_offset = struct.unpack("<I", header[10:14])[0]
+
+            # Read DIB header (40 bytes for BITMAPINFOHEADER)
+            dib_header = f.read(40)
+            width = struct.unpack("<I", dib_header[4:8])[0]
+            height = struct.unpack("<I", dib_header[8:12])[0]
+            bits_per_pixel = struct.unpack("<H", dib_header[14:16])[0]
+
+            if bits_per_pixel != 1:
+                raise ValueError("Not a 1-bit BMP")
+
+            # Calculate row size (padded to 4 bytes)
+            row_size = ((width + 31) // 32) * 4
+
+            # Create framebuffer (MONO_HLSB format)
+            fb_width_bytes = (width + 7) // 8
+            fb_data = bytearray(fb_width_bytes * height)
+
+            # Seek to pixel data
+            f.seek(pixel_offset)
+
+            # Read pixel data (BMP stores bottom-to-top)
+            for y in range(height - 1, -1, -1):
+                row_data = f.read(row_size)
+
+                # Copy relevant bytes to framebuffer
+                for x_byte in range(fb_width_bytes):
+                    if x_byte < len(row_data):
+                        # BMP is LSB first, framebuffer might need adjustment
+                        fb_data[y * fb_width_bytes + x_byte] = row_data[x_byte]
+
+            # Create framebuffer object
+            fb = framebuf.FrameBuffer(fb_data, width, height, framebuf.MONO_HLSB)
+
+            return fb, fb_data, width, height
+
+    def draw_bmp(self, filename, x, y):
+        """Display a BMP file at the given X/Y coordinates"""
+        try:
+            # Load the BMP file
+            bmp_fb, bmp_data, bmp_width, bmp_height = self._load_bmp(filename)
+
+            # Calculate bounds checking
+            if (
+                x < 0
+                or y < 0
+                or x + bmp_width > self.width
+                or y + bmp_height > self.height
+            ):
+                self._log(
+                    f"BMP at ({x},{y}) with size {bmp_width}x{bmp_height} would be out of bounds"
+                )
+                return False
+
+            # Copy BMP pixels to the main framebuffer
+            for by in range(bmp_height):
+                for bx in range(bmp_width):
+                    # Get pixel from BMP framebuffer
+                    pixel = bmp_fb.pixel(bx, by)
+                    # Set pixel in main framebuffer (invert if needed for your display)
+                    self.framebuf.pixel(x + bx, y + by, pixel)
+
+            self._log(f"Displayed BMP {filename} at ({x},{y})")
+            return True
+
+        except Exception as e:
+            self._log(f"Error displaying BMP {filename}: {e}")
+            return False
